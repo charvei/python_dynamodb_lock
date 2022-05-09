@@ -37,6 +37,7 @@ class DynamoDBLockClient:
     _DEFAULT_EXPIRY_PERIOD = datetime.timedelta(hours=1)
     _DEFAULT_HEARTBEAT_TPS = -1
     _DEFAULT_APP_CALLBACK_THREADPOOL_SIZE = 5
+    _DEFAULT_SHUTDOWN_CHECK_PERIOD = _DEFAULT_HEARTBEAT_PERIOD
     # for optional create-table method
     _DEFAULT_READ_CAPACITY = 5
     _DEFAULT_WRITE_CAPACITY = 5
@@ -62,7 +63,8 @@ class DynamoDBLockClient:
                  lease_duration=_DEFAULT_LEASE_DURATION,
                  expiry_period=_DEFAULT_EXPIRY_PERIOD,
                  heartbeat_tps=_DEFAULT_HEARTBEAT_TPS,
-                 app_callback_executor=None
+                 shutdown_check_period=_DEFAULT_SHUTDOWN_CHECK_PERIOD,
+                 app_callback_executor=None,
                  ):
         """
         :param boto3.ServiceResource dynamodb_resource: mandatory argument
@@ -88,6 +90,9 @@ class DynamoDBLockClient:
                 to -1, the client will distribute the heartbeat calls evenly over the _heartbeat_period
                 - which uses lower throughput for smaller number of locks. However, if you want a more
                 deterministic heartbeat-call-rate, then specify an explicit TPS value. Defaults to -1.
+        :param datetime.timedelta shutdown_check_period: How often daemon threads should
+                periodically check for whether the client is shutting down while waiting to
+                perform their next action.
         :param ThreadPoolExecutor app_callback_executor: The executor to be used for invoking the
                 app_callbacks in case of un-expected errors. Defaults to a ThreadPoolExecutor with a
                 maximum of 5 threads.
@@ -108,6 +113,7 @@ class DynamoDBLockClient:
             max_workers=self._DEFAULT_APP_CALLBACK_THREADPOOL_SIZE,
             thread_name_prefix='DynamoDBLockClient-AC-' + self._uuid + "-"
         )
+        self._shutdown_check_period = shutdown_check_period
         # additional properties
         self._locks = {}
         self._shutting_down = False
@@ -164,10 +170,21 @@ class DynamoDBLockClient:
             end_time = time.monotonic()
             next_start_time = start_time + self._heartbeat_period.total_seconds()
             if end_time < next_start_time and not self._shutting_down:
-                time.sleep( next_start_time - end_time )
+                self._sleep_until_next_start_time_or_shutdown(next_start_time)
             elif end_time > next_start_time + avg_loop_time:
                 logger.warning('Sending heartbeats for all the locks took longer than the _heartbeat_period')
 
+    def _sleep_until_next_start_time_or_shutdown(self, next_start_time):
+        """
+        Sleep until the next start time with periodic wake ups every _shutdown_check_period
+        duration to determine if the client is shutting down and can end it's sleep early.
+        """
+        while (sleep_left := next_start_time - time.monotonic()) > 0 and not self._shutting_down:
+            time.sleep(
+                self._shutdown_check_period.total_seconds()
+                if self._shutdown_check_period.total_seconds() < sleep_left
+                else sleep_left
+            )
 
     def _send_heartbeat(self, lock):
         """
@@ -281,7 +298,7 @@ class DynamoDBLockClient:
             end_time = time.monotonic()
             next_start_time = start_time + self._heartbeat_period.total_seconds()
             if end_time < next_start_time and not self._shutting_down:
-                time.sleep( next_start_time - end_time )
+                self._sleep_until_next_start_time_or_shutdown(next_start_time)
             else:
                 logger.warning('Checking heartbeats for all the locks took longer than the _heartbeat_period')
 
